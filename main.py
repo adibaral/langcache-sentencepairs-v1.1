@@ -3,6 +3,8 @@ import os
 import pandas as pd
 from datasets import Dataset, DatasetDict, concatenate_datasets
 from datasets import Features, Value
+from itertools import combinations
+import multiprocessing
 
 
 def convert_label_to_int(example):
@@ -27,7 +29,7 @@ def convert_label_to_int(example):
 
 
 def standardize_labels(dataset):
-    dataset = dataset.map(convert_label_to_int)
+    dataset = dataset.map(convert_label_to_int, num_proc=multiprocessing.cpu_count())
     dataset = dataset.cast(
         Features(
             {
@@ -38,6 +40,16 @@ def standardize_labels(dataset):
         )
     )
     return dataset
+
+
+def remove_null_examples(dataset):
+    """
+    Remove examples with null values in the sentence1 or sentence2 columns.
+    """
+    return dataset.filter(
+        lambda x: x.get("sentence1") is not None and x.get("sentence2") is not None,
+        num_proc=multiprocessing.cpu_count(),
+    )
 
 
 def load_paws_dataset():
@@ -129,37 +141,67 @@ def load_stsb_dataset():
     return train_dataset, val_dataset, test_dataset
 
 
-def load_opusparcus_dataset():
+def load_opusparcus_dataset(dir: str = "data/opusparcus"):
     """
-    Load the OpusParCus dataset from the Hugging Face Hub.
+    Load the OpusParCus dataset from the local directory.
     """
-    dataset = load_dataset("GEM/opusparcus", lang="en", quality=80)
-    train_dataset = dataset["train"]
-    val_dataset = dataset["validation.full"]
-    test_dataset = dataset["test.full"]
-    # rename the columns
-    train_dataset = train_dataset.rename_columns(
-        {"sent1": "sentence1", "sent2": "sentence2", "annot_score": "label"}
-    )
-    val_dataset = val_dataset.rename_columns(
-        {"sent1": "sentence1", "sent2": "sentence2", "annot_score": "label"}
-    )
-    test_dataset = test_dataset.rename_columns(
-        {"sent1": "sentence1", "sent2": "sentence2", "annot_score": "label"}
-    )
-    # drop the columns that are not needed
+    train_path = os.path.join(dir, "train_en.70.jsonl")
+    val_path = os.path.join(dir, "validation.jsonl")
+    test_path = os.path.join(dir, "test.jsonl")
+
+    def should_keep(example, filter_quality=True):
+        """Filter function - returns True if example should be kept"""
+        try:
+            return not (
+                (filter_quality and example.get("quality", 0) < 90)
+                or example["lang"] != "en"
+            )
+        except:
+            return False
+
+    def process_example(example):
+        """Process example after filtering"""
+        try:
+            if "annot_score" in example:
+                label = 1.0 if example["annot_score"] >= 3.0 else 0.0
+            else:
+                label = 1.0
+            return {
+                "sentence1": example["sent1"],
+                "sentence2": example["sent2"],
+                "label": label,
+            }
+        except:
+            # Return a valid example even if processing fails
+            return {"sentence1": "", "sentence2": "", "label": 0}
+
+    train_raw = load_dataset("json", data_files=train_path, split="train")
+    val_raw = load_dataset("json", data_files=val_path, split="train")
+    test_raw = load_dataset("json", data_files=test_path, split="train")
+
+    train_dataset = train_raw.filter(
+        lambda x: should_keep(x, filter_quality=True),
+        num_proc=multiprocessing.cpu_count(),
+    ).map(process_example, num_proc=multiprocessing.cpu_count())
+
+    val_dataset = val_raw.filter(
+        lambda x: should_keep(x, filter_quality=False),
+        num_proc=multiprocessing.cpu_count(),
+    ).map(process_example, num_proc=multiprocessing.cpu_count())
+
+    test_dataset = test_raw.filter(
+        lambda x: should_keep(x, filter_quality=False),
+        num_proc=multiprocessing.cpu_count(),
+    ).map(process_example, num_proc=multiprocessing.cpu_count())
+
     train_dataset = train_dataset.select_columns(["sentence1", "sentence2", "label"])
     val_dataset = val_dataset.select_columns(["sentence1", "sentence2", "label"])
-    # map the labels. On the train, everything should be 1.0. On valid and test, [0, 2] -> non-paraphrases, [3, 4] -> paraphrases (can be float)
-    train_dataset = train_dataset.map(lambda x: {"label": 1.0})
-    val_dataset = val_dataset.map(lambda x: {"label": 1.0 if x["label"] >= 3 else 0.0})
-    test_dataset = test_dataset.map(
-        lambda x: {"label": 1.0 if x["label"] >= 3 else 0.0}
-    )
-    # standardize labels
+    test_dataset = test_dataset.select_columns(["sentence1", "sentence2", "label"])
+
     train_dataset = standardize_labels(train_dataset)
     val_dataset = standardize_labels(val_dataset)
     test_dataset = standardize_labels(test_dataset)
+
     return train_dataset, val_dataset, test_dataset
 
 
@@ -217,7 +259,7 @@ def load_parade_dataset(dir: str = "data/parade"):
 
 
 def load_ttic31190_dataset(
-    dir: str = "/opt/dlami/nvme/crossencoder-training-data/ttic-31190",
+    dir: str = "data/ttic31190",
 ):
     """
     Load the TTIC-31190 dataset from the local directory.
@@ -521,13 +563,99 @@ def read_paralex_dataset(
     return train_dataset, None, None
 
 
-def remove_null_examples(dataset):
+def load_wikianswers_dataset():
     """
-    Remove examples with null values in the sentence1 or sentence2 columns.
+    Load the WikiAnswers dataset from the Hugging Face Hub.
     """
-    return dataset.filter(
-        lambda x: x.get("sentence1") is not None and x.get("sentence2") is not None
+    dataset = load_dataset("embedding-data/WikiAnswers", split="train")
+
+    def cluster_to_pairs(example):
+        qs = example["set"]
+        return {
+            "sentence1": [q1 for q1, q2 in combinations(qs, 2)],
+            "sentence2": [q2 for q1, q2 in combinations(qs, 2)],
+            "label": [1] * (len(qs) * (len(qs) - 1) // 2),
+        }
+
+    # Run in parallel across CPU cores
+    pairs_dataset = dataset.map(
+        cluster_to_pairs,
+        batched=False,
+        remove_columns=["set"],
+        num_proc=multiprocessing.cpu_count(),
+    ).flatten_indices()
+
+    return pairs_dataset, None, None
+
+
+def load_tapaco_dataset():
+    """
+    Load the TAPACO dataset from the Hugging Face Hub.
+    """
+    dataset = load_dataset("community-datasets/tapaco", "en", split="train")
+    # Group by paraphrase_set_id first
+    grouped = dataset.to_pandas().groupby("paraphrase_set_id")["paraphrase"].apply(list)
+    # Wrap in a dataset so we can map over clusters
+    cluster_dataset = Dataset.from_dict({"paraphrases": grouped.tolist()})
+
+    def make_pairs(batch):
+        results = {"sentence1": [], "sentence2": [], "label": []}
+        for sentences in batch["paraphrases"]:
+            if len(sentences) < 2:
+                continue
+            for s1, s2 in combinations(sentences, 2):
+                results["sentence1"].append(s1)
+                results["sentence2"].append(s2)
+                results["label"].append(1.0)
+        return results
+
+    pairs = cluster_dataset.map(
+        make_pairs,
+        batched=True,
+        remove_columns=["paraphrases"],
+        num_proc=multiprocessing.cpu_count(),
     )
+    pairs = standardize_labels(pairs)
+    return pairs, None, None
+
+
+def load_paraphrase_collections_dataset():
+    """
+    Load the Paraphrase Collections dataset from the Hugging Face Hub.
+    """
+    dataset = load_dataset("xwjzds/paraphrase_collections", split="train")
+    dataset = dataset.rename_columns({"input": "sentence1", "output": "sentence2"})
+    dataset = dataset.map(lambda example: {"label": 1})
+    dataset = dataset.select_columns(["sentence1", "sentence2", "label"])
+    dataset = standardize_labels(dataset)
+    return dataset, None, None
+
+
+def load_chatgpt_paraphrases_dataset():
+    """
+    Load the ChatGPT Paraphrases dataset from the Hugging Face Hub.
+    """
+    dataset = load_dataset("humarin/chatgpt-paraphrases", split="train")
+
+    def create_paraphrase_pairs(batch):
+        results = {"sentence1": [], "sentence2": [], "label": []}
+        for text, paraphrases_str in zip(batch["text"], batch["paraphrases"]):
+            paraphrases_list = eval(paraphrases_str)
+
+            for paraphrase in paraphrases_list:
+                results["sentence1"].append(text)
+                results["sentence2"].append(paraphrase)
+                results["label"].append(1.0)
+        return results
+
+    pairs_dataset = dataset.map(
+        create_paraphrase_pairs,
+        batched=True,
+        remove_columns=["text", "paraphrases", "category", "source"],
+        num_proc=multiprocessing.cpu_count(),
+    )
+    pairs_dataset = standardize_labels(pairs_dataset)
+    return pairs_dataset, None, None
 
 
 if __name__ == "__main__":
@@ -537,12 +665,16 @@ if __name__ == "__main__":
         "mrpc": load_mrpc_dataset,
         "qqp": load_qqp_dataset,
         "parade": load_parade_dataset,
-        # "ttic31190": load_ttic31190_dataset, # TODO: Need to sample negatives
         "pit2015": load_pit2015_dataset,
-        # "opusparcus": load_opusparcus_dataset, # TODO: There is some error here. The dataset is not loading.
         "apt": load_apt_dataset,
         "stsb": load_stsb_dataset,
         "sick": load_sick_dataset,
+        # "wikianswers": load_wikianswers_dataset, # Too large for now
+        "ttic31190": load_ttic31190_dataset,
+        "tapaco": load_tapaco_dataset,
+        "paraphrase-collections": load_paraphrase_collections_dataset,
+        "chatgpt-paraphrases": load_chatgpt_paraphrases_dataset,
+        "opusparcus": load_opusparcus_dataset,
         # "parasci-acl": lambda: load_parasci_dataset("crossencoder-training-data/parasci/Data/ParaSCI-ACL"), # TODO: Need to sample negatives
         # "parasci-arxiv": lambda: load_parasci_dataset("crossencoder-training-data/parasci/Data/ParaSCI-arXiv"), # TODO: Need to sample negatives
         # "paralex": read_paralex_dataset, # TODO: Need to sample negatives
@@ -593,25 +725,50 @@ if __name__ == "__main__":
     merged_dataset["train"] = concatenate_datasets(train_datasets)
     merged_dataset["validation"] = concatenate_datasets(val_datasets)
     merged_dataset["test"] = concatenate_datasets(test_datasets)
-    
+
+    def remove_duplicates(dataset):
+        """Remove duplicate (sentence1, sentence2) pairs using datasets-pandas integration."""
+        # Use native datasets-pandas integration for efficient deduplication
+        df = dataset.to_pandas()
+        df_unique = df.drop_duplicates(subset=["sentence1", "sentence2"])
+        unique_dataset = Dataset.from_pandas(df_unique)
+        # Remove the pandas index column that gets added
+        if "__index_level_0__" in unique_dataset.column_names:
+            unique_dataset = unique_dataset.remove_columns(["__index_level_0__"])
+        return unique_dataset
+
+    # Remove duplicates from each split
+    print(
+        f"Before deduplication - Train: {len(merged_dataset['train'])}, Val: {len(merged_dataset['validation'])}, Test: {len(merged_dataset['test'])}"
+    )
+    merged_dataset["train"] = remove_duplicates(merged_dataset["train"])
+    merged_dataset["validation"] = remove_duplicates(merged_dataset["validation"])
+    merged_dataset["test"] = remove_duplicates(merged_dataset["test"])
+    print(
+        f"After deduplication - Train: {len(merged_dataset['train'])}, Val: {len(merged_dataset['validation'])}, Test: {len(merged_dataset['test'])}"
+    )
+
     # add formatted idx column to each dataset
     train_total = len(merged_dataset["train"])
     val_total = len(merged_dataset["validation"])
     test_total = len(merged_dataset["test"])
-    
+
     # Determine padding width based on total number of examples
     train_padding = len(str(train_total - 1))
     val_padding = len(str(val_total - 1))
     test_padding = len(str(test_total - 1))
-    
+
     merged_dataset["train"] = merged_dataset["train"].map(
-        lambda ex, idx: {"id": f"langcache_train_{idx:0{train_padding}d}"}, with_indices=True
+        lambda ex, idx: {"id": f"langcache_train_{idx:0{train_padding}d}"},
+        with_indices=True,
     )
     merged_dataset["validation"] = merged_dataset["validation"].map(
-        lambda ex, idx: {"id": f"langcache_validation_{idx:0{val_padding}d}"}, with_indices=True
+        lambda ex, idx: {"id": f"langcache_validation_{idx:0{val_padding}d}"},
+        with_indices=True,
     )
     merged_dataset["test"] = merged_dataset["test"].map(
-        lambda ex, idx: {"id": f"langcache_test_{idx:0{test_padding}d}"}, with_indices=True
+        lambda ex, idx: {"id": f"langcache_test_{idx:0{test_padding}d}"},
+        with_indices=True,
     )
 
     for split in ["train", "validation", "test"]:
@@ -627,13 +784,15 @@ if __name__ == "__main__":
                 }
             )
         )
-    
+
     # Reorder columns to desired order: id, source_idx, source, sentence1, sentence2, label
     column_order = ["id", "source_idx", "source", "sentence1", "sentence2", "label"]
     merged_dataset["train"] = merged_dataset["train"].select_columns(column_order)
-    merged_dataset["validation"] = merged_dataset["validation"].select_columns(column_order)
+    merged_dataset["validation"] = merged_dataset["validation"].select_columns(
+        column_order
+    )
     merged_dataset["test"] = merged_dataset["test"].select_columns(column_order)
-    
+
     print(merged_dataset)
     # push the dataset to the hub
     merged_dataset.push_to_hub(
